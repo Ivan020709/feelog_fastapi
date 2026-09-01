@@ -156,11 +156,18 @@ class MessageItem(BaseModel):
 
 class ChatRequest(BaseModel):
 
+    userid: Optional[int] = 0
+
     session_id: str
 
     character: str
 
     message: str
+
+    # Spring 서버가 DB에서 조회한 친밀도 정보입니다.
+    affinityLevel: Optional[int] = 1
+    affinityName: Optional[str] = "처음 만난 사이"
+    toneGuide: Optional[str] = "정중하고 조심스러운 존댓말로 대화하세요."
 
     history: Optional[List[MessageItem]] = []
 
@@ -254,6 +261,15 @@ async def chat(req: ChatRequest):
 [대화 스타일]
 
 {character["style"]}
+
+
+[사용자와의 현재 친밀도]
+
+친밀도 {req.affinityLevel}단계 - {req.affinityName}
+
+{req.toneGuide}
+
+친밀도 말투를 적용하되, 위에 정의된 캐릭터 고유 성격은 그대로 유지한다.
 
 
 [상담 원칙]
