@@ -1,5 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from dotenv import load_dotenv
 
@@ -10,11 +11,28 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import (
     HumanMessage,
     AIMessage,
-    BaseMessage
+    BaseMessage,
+    SystemMessage,
+    ToolMessage
 )
+from langchain_core.tools import tool
+from openai import OpenAI
 
 import os
 import json
+import base64
+import re
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from datetime import datetime
+
+# psycopg가 아직 설치되지 않아도 기본 AI 대화 서버는 정상 실행됩니다.
+# 계약서 RAG를 사용할 때만 설치 여부를 확인합니다.
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
 
 
 # =========================================================
@@ -34,6 +52,19 @@ if not OPENAI_API_KEY:
 # =========================================================
 
 app = FastAPI()
+
+# 이미지와 문서가 저장되는 폴더입니다.
+DOWNLOAD_DIR = Path(__file__).parent / "generated_files"
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+app.mount("/download", StaticFiles(directory=str(DOWNLOAD_DIR)), name="download")
+
+# PostgreSQL+pgvector 접속 정보입니다. DBeaver에서도 같은 정보로 접속하면 됩니다.
+POSTGRES_URL = os.getenv(
+    "POSTGRES_URL",
+    "postgresql://postgres:postgres@localhost:5432/feelog_rag"
+)
+FASTAPI_PUBLIC_URL = os.getenv("FASTAPI_PUBLIC_URL", "http://localhost:8000")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # =========================================================
@@ -61,6 +92,152 @@ llm = ChatOpenAI(
     temperature=0.7,
     api_key=OPENAI_API_KEY
 )
+
+
+# =========================================================
+# AI 도구
+# =========================================================
+
+def safe_file_name(file_name: str, default_name: str) -> str:
+    """상위 폴더로 빠져나가는 파일명을 막고 안전한 이름만 남깁니다."""
+    name = Path(file_name or default_name).name
+    return re.sub(r"[^가-힣a-zA-Z0-9._-]", "_", name)
+
+
+def embedding(text: str):
+    result = openai_client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text
+    )
+    # pgvector가 바로 읽을 수 있는 '[0.1,0.2,...]' 문자열로 변환합니다.
+    return json.dumps(result.data[0].embedding)
+
+
+def embeddings(texts: List[str]):
+    """여러 계약서 조각을 한 번의 요청으로 벡터화해 속도와 요청 횟수를 줄입니다."""
+    result = openai_client.embeddings.create(
+        model="text-embedding-3-small",
+        input=texts
+    )
+    return [json.dumps(item.embedding) for item in result.data]
+
+
+def prepare_vector_table():
+    """PostgreSQL에 pgvector 확장과 계약서 테이블이 없으면 생성합니다."""
+    if psycopg is None:
+        raise RuntimeError(
+            "계약서 RAG를 사용하려면 pip install 'psycopg[binary]'를 실행해 주세요."
+        )
+    with psycopg.connect(POSTGRES_URL) as con:
+        with con.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS contract_chunk (
+                    id BIGSERIAL PRIMARY KEY,
+                    source VARCHAR(255) NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    embedding VECTOR(1536) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        con.commit()
+
+
+@tool
+def web_search_tool(query: str) -> str:
+    """최신 정보나 인터넷 확인이 필요한 질문을 검색합니다."""
+    try:
+        params = urllib.parse.urlencode({
+            "q": query,
+            "format": "json",
+            "no_html": 1,
+            "skip_disambig": 1
+        })
+        with urllib.request.urlopen(
+            f"https://api.duckduckgo.com/?{params}", timeout=10
+        ) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        result = data.get("AbstractText", "")
+        related = []
+        for item in data.get("RelatedTopics", []):
+            if isinstance(item, dict) and item.get("Text"):
+                related.append(item["Text"])
+            if len(related) >= 5:
+                break
+
+        combined = "\n".join([result] + related).strip()
+        return combined or "관련 검색 결과를 찾지 못했습니다."
+    except Exception as e:
+        return f"인터넷 검색 중 오류가 발생했습니다: {e}"
+
+
+@tool
+def search_contract_tool(query: str) -> str:
+    """PostgreSQL에 저장된 계약서 조각 중 질문과 가까운 내용을 검색합니다."""
+    try:
+        prepare_vector_table()
+        query_vector = embedding(query)
+        with psycopg.connect(POSTGRES_URL) as con:
+            with con.cursor() as cur:
+                cur.execute("""
+                    SELECT source, content,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM contract_chunk
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT 4
+                """, (query_vector, query_vector))
+                rows = cur.fetchall()
+        if not rows:
+            return "저장된 계약서에서 관련 내용을 찾지 못했습니다."
+        return "\n\n".join(
+            f"[출처: {source} / 유사도: {similarity:.3f}]\n{content}"
+            for source, content, similarity in rows
+        )
+    except Exception as e:
+        return f"계약서 검색 중 오류가 발생했습니다: {e}"
+
+
+@tool
+def create_document_tool(file_name: str, content: str) -> str:
+    """사용자가 요청한 내용을 UTF-8 텍스트 문서로 생성합니다."""
+    name = safe_file_name(file_name, f"document_{datetime.now():%Y%m%d_%H%M%S}.txt")
+    if "." not in name:
+        name += ".txt"
+    (DOWNLOAD_DIR / name).write_text(content, encoding="utf-8")
+    return f"DOCUMENT_CREATED:{name}"
+
+
+@tool
+def generate_image_tool(prompt: str, file_name: str = "generated_image.png") -> str:
+    """OpenAI 이미지 모델로 이미지를 생성하여 다운로드 폴더에 저장합니다."""
+    try:
+        name = safe_file_name(file_name, "generated_image.png")
+        if not name.lower().endswith(".png"):
+            name += ".png"
+        response = openai_client.images.generate(
+            model="gpt-image-1",
+            prompt=prompt,
+            size="1024x1024"
+        )
+        image_data = response.data[0].b64_json
+        if not image_data:
+            return "IMAGE_ERROR:이미지 데이터가 비어 있습니다."
+        (DOWNLOAD_DIR / name).write_bytes(base64.b64decode(image_data))
+        return f"IMAGE_CREATED:{name}"
+    except Exception as e:
+        return f"IMAGE_ERROR:{e}"
+
+
+TOOLS = [
+    web_search_tool,
+    search_contract_tool,
+    create_document_tool,
+    generate_image_tool
+]
+TOOLS_BY_NAME = {item.name: item for item in TOOLS}
+llm_with_tools = llm.bind_tools(TOOLS)
 
 
 # =========================================================
@@ -151,10 +328,13 @@ class MessageItem(BaseModel):
     sender: str
     # USER / AI
 
-    content: str
+    # 이전 요청 실패로 빈 말풍선이 남아 있어도 전체 채팅 요청을 거절하지 않습니다.
+    content: Optional[str] = ""
 
 
 class ChatRequest(BaseModel):
+
+    userid: Optional[int] = 0
 
     session_id: str
 
@@ -176,6 +356,68 @@ class AnalyzeRequest(BaseModel):
     character: str
 
     history: List[MessageItem]
+
+
+class ContractRequest(BaseModel):
+    source: str = "contract"
+    content: str
+
+
+def save_contract_chunks(source: str, content: str):
+    """계약서 원문을 나누어 PostgreSQL에 저장하는 공통 함수입니다."""
+    prepare_vector_table()
+    chunks = [content[i:i + 800] for i in range(0, len(content), 800)]
+    vectors = embeddings(chunks)
+
+    with psycopg.connect(POSTGRES_URL) as con:
+        with con.cursor() as cur:
+            # 같은 파일을 다시 넣을 때 중복되지 않도록 기존 조각을 먼저 교체합니다.
+            cur.execute("DELETE FROM contract_chunk WHERE source = %s", (source,))
+            cur.executemany("""
+                INSERT INTO contract_chunk(source, chunk_index, content, embedding)
+                VALUES (%s, %s, %s, %s::vector)
+            """, [
+                (source, index, chunk, vectors[index])
+                for index, chunk in enumerate(chunks)
+            ])
+        con.commit()
+    return len(chunks)
+
+
+@app.post("/contract/ingest")
+async def ingest_contract(req: ContractRequest):
+    """준비한 계약서 내용을 800자 단위로 나누어 PostgreSQL에 저장합니다."""
+    if not req.content.strip():
+        raise HTTPException(status_code=400, detail="계약서 내용이 비어 있습니다.")
+    try:
+        saved_count = save_contract_chunks(req.source, req.content)
+        return {"message": "OK", "saved_chunks": saved_count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/contract/ingest-file")
+async def ingest_contract_file():
+    """FastAPIServer 폴더의 contract.txt를 읽어 PostgreSQL에 저장합니다."""
+    contract_path = Path(__file__).parent / "contract.txt"
+    if not contract_path.exists():
+        raise HTTPException(status_code=404, detail="contract.txt 파일을 찾을 수 없습니다.")
+    try:
+        content = contract_path.read_text(encoding="utf-8")
+        saved_count = save_contract_chunks(contract_path.name, content)
+        return {
+            "message": "OK",
+            "source": contract_path.name,
+            "saved_chunks": saved_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/contract/search")
+async def search_contract(query: str):
+    """DBeaver에 저장된 계약서가 정상 검색되는지 직접 시험하는 API입니다."""
+    return {"message": search_contract_tool.invoke({"query": query})}
 
 
 # =========================================================
@@ -278,6 +520,20 @@ async def chat(req: ChatRequest):
 
 10. 의료적 진단이나 정신질환 진단을 단정하지 않는다.
 
+11. 답을 짧게 끝내지 말고 사용자가 말한 구체적인 상황과 감정을 한 번 되짚는다.
+
+12. 한 번에 여러 질문을 쏟아내지 말고, 지금 가장 도움이 되는 질문 하나를 자연스럽게 건넨다.
+
+13. 사용자의 감정을 임의로 단정하지 않고 "그랬을 수도 있겠어요"처럼 여지를 둔다.
+
+14. 고민·감정과 관계없는 질문은 차갑게 거절하지 않는다. 짧게 반응하되 해당 주제의 정답이나 자세한 정보는 제공하지 않고, 사용자가 지금 어떤 마음으로 그 이야기를 꺼냈는지 부드럽게 상담 주제로 돌아온다.
+
+15. 사용자가 이미지 생성, 문서 생성, 인터넷 검색, 계약서 내용 검색을 명확히 요청하면 알맞은 도구를 사용한다.
+
+16. 자해·타해 등 즉각적인 위험이 드러나면 혼자 견디게 하지 말고 주변의 신뢰할 사람과 지역 응급기관에 즉시 도움을 요청하도록 안내한다.
+
+17. 공감만 반복하지 말고 필요할 때는 상황 정리, 선택지 비교, 작은 실천 한 가지를 제안한다.
+
 """
 
 
@@ -291,6 +547,11 @@ async def chat(req: ChatRequest):
     # 이전 대화
 
     for item in req.history:
+
+        # 내용이 없는 이전 말풍선은 AI에게 전달할 대화가 아니므로 건너뜁니다.
+        if not item.content:
+
+            continue
 
         if item.sender == "USER":
 
@@ -322,12 +583,7 @@ async def chat(req: ChatRequest):
     # 시스템 메시지를 가장 앞에 추가
     # -----------------------------------------------------
 
-    langchain_messages.insert(
-        0,
-        HumanMessage(
-            content=system_prompt
-        )
-    )
+    langchain_messages.insert(0, SystemMessage(content=system_prompt))
 
 
     # -----------------------------------------------------
@@ -336,17 +592,47 @@ async def chat(req: ChatRequest):
 
     try:
 
-        response = llm.invoke(
-            langchain_messages
-        )
+        response = llm_with_tools.invoke(langchain_messages)
 
-        ai_reply = response.content
+        file_name = None
+        file_url = None
+        tool_name = None
+
+        if response.tool_calls:
+            messages_with_tools = list(langchain_messages)
+            messages_with_tools.append(response)
+
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                selected_tool = TOOLS_BY_NAME.get(tool_name)
+                if not selected_tool:
+                    continue
+
+                tool_result = selected_tool.invoke(tool_call["args"])
+                messages_with_tools.append(
+                    ToolMessage(
+                        content=str(tool_result),
+                        tool_call_id=tool_call["id"]
+                    )
+                )
+
+                if str(tool_result).startswith(("DOCUMENT_CREATED:", "IMAGE_CREATED:")):
+                    file_name = str(tool_result).split(":", 1)[1]
+                    file_url = f"{FASTAPI_PUBLIC_URL}/download/{file_name}"
+
+            final_response = llm.invoke(messages_with_tools)
+            ai_reply = final_response.content
+        else:
+            ai_reply = response.content
 
     except Exception as e:
 
         print("AI 오류:", e)
 
         ai_reply = "죄송해요. AI와 연결하는 과정에서 문제가 발생했어요."
+        file_name = None
+        file_url = None
+        tool_name = None
 
 
     # -----------------------------------------------------
@@ -359,7 +645,13 @@ async def chat(req: ChatRequest):
 
         "character": character["name"],
 
-        "message": ai_reply
+        "message": ai_reply,
+
+        "tool_name": tool_name,
+
+        "file_name": file_name,
+
+        "file_url": file_url
 
     }
 
