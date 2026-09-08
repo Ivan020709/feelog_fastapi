@@ -2,8 +2,10 @@ fastapi
 uvicorn
 python-dotenv
 pydantic
+
 langchain
 langchain-openai
 langchain-core
 openai
+
 psycopg[binary]
