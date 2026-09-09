@@ -1,0 +1,32 @@
+name: FastAPI Server
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: SSH로 EC2접속하여 작업
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          DOTENV: ${{ secrets.DOTENV }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_PRIVATE_KEY }}
+          envs: DOTENV 
+          script: |
+            cd /home/ubuntu/feelog_fastapi
+            sudo rm -rf .env
+            git pull origin main
+            echo "$DOTENV" > .env
+            
+            docker stop fastapiserver || true
+            docker rm fastapiserver || true
+            
+            docker build --no-cache -t fastapiserver .
+            docker run -d --name fastapiserver -p 8000:8000 fastapiserver
