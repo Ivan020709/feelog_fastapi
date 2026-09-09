@@ -29,7 +29,7 @@ from datetime import datetime
 
 
 # psycopg가 아직 설치되지 않아도 기본 AI 대화 서버는 정상 실행됩니다.
-# 계약서 RAG를 사용할 때만 설치 여부를 확인합니다.
+# 계약서 RAG를 사용할 때만 설치 여부를 확인합니다...
 try:
     import psycopg
 except ImportError:
