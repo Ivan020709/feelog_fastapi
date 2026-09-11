@@ -25,8 +25,8 @@ jobs:
             git pull origin main
             echo "$DOTENV" > .env
             
-            docker stop fastapiserver || true
-            docker rm fastapiserver || true
+            docker stop fastapi || true
+            docker rm fastapi || true
             
-            docker build --no-cache -t fastapiserver .
-            docker run -d --name fastapiserver -p 8000:8000 fastapiserver
+            docker build --no-cache -t fastapi .
+            docker run -d --name fastapi -p 8000:8000 fastapi
